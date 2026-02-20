@@ -6,6 +6,11 @@ authors.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# default = [] so refluxdb (sysinfo 0.30) and path-patch build with refresh(); core crates opt in via features = ["sysinfo_0_35"]
+# sysinfo 0.35+ has refresh(bool); 0.30 has refresh() with no args
+sysinfo_0_35 = []
+
 [lints]
 workspace = true
 

@@ -93,7 +93,10 @@ impl DiskSpaceMetrics {
 
         // Load the disk stats once, and refresh them later.
         let mut disks = Disks::new();
+        #[cfg(feature = "sysinfo_0_35")]
         disks.refresh(true);
+        #[cfg(not(feature = "sysinfo_0_35"))]
+        disks.refresh();
 
         // Resolve the mount point once.
         // The directory path may be `/path/to/dir` and the mount point is `/`.

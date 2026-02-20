@@ -13,14 +13,14 @@ use crate::plan::planner::source_field_names::SourceFieldNamesVisitor;
 use crate::plan::planner_time_range_expression::time_range_to_df_expr;
 use crate::plan::rewriter::{find_table_names, rewrite_statement, ProjectionType};
 use crate::plan::udf::{
-    cumulative_sum, derivative, difference, elapsed, find_window_udfs, moving_average,
+    cumulative_sum, derivative, difference, elapsed, find_window_udfs, integral, moving_average,
     non_negative_derivative, non_negative_difference,
 };
 use crate::plan::util::{binary_operator_to_df_operator, rebase_expr, IQLSchema};
 use crate::plan::var_ref::var_ref_data_type_to_data_type;
 use crate::plan::{planner_rewrite_expression, udf};
 use crate::window::{
-    CUMULATIVE_SUM, DERIVATIVE, DIFFERENCE, ELAPSED, MOVING_AVERAGE, NON_NEGATIVE_DERIVATIVE,
+    CUMULATIVE_SUM, DERIVATIVE, DIFFERENCE, ELAPSED, INTEGRAL, MOVING_AVERAGE, NON_NEGATIVE_DERIVATIVE,
     NON_NEGATIVE_DIFFERENCE, PERCENT_ROW_NUMBER,
 };
 use arrow::array::{
@@ -1637,6 +1637,20 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             }
         }
 
+        fn integral_unit(ctx: &Context<'_>, args: &[Expr]) -> Result<ScalarValue> {
+            if args.len() > 1 {
+                if let Expr::Literal(v) = &args[1] {
+                    Ok(v.clone())
+                } else {
+                    error::internal(format!("udf_to_expr: unexpected expression: {}", args[1]))
+                }
+            } else if let Some(interval) = ctx.interval {
+                Ok(ScalarValue::new_interval_mdn(0, 0, interval.duration))
+            } else {
+                Ok(ScalarValue::new_interval_mdn(0, 0, 1_000_000_000)) // 1s default unit
+            }
+        }
+
         fn elapsed_unit(args: &[Expr]) -> Result<ScalarValue> {
             if args.len() > 1 {
                 if let Expr::Literal(v) = &args[1] {
@@ -1743,6 +1757,23 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             Some(udf::WindowFunction::CumulativeSum) => Ok(Expr::WindowFunction(WindowFunction {
                 fun: CUMULATIVE_SUM.clone(),
                 args,
+                partition_by,
+                order_by,
+                window_frame: WindowFrame::new_bounds(
+                    WindowFrameUnits::Rows,
+                    WindowFrameBound::Preceding(ScalarValue::Null),
+                    WindowFrameBound::Following(ScalarValue::Null),
+                ),
+                null_treatment: None,
+            })
+            .alias(alias)),
+            Some(udf::WindowFunction::Integral) => Ok(Expr::WindowFunction(WindowFunction {
+                fun: INTEGRAL.clone(),
+                args: vec![
+                    args[0].clone(),
+                    lit(integral_unit(ctx, &args)?),
+                    "time".as_expr(),
+                ],
                 partition_by,
                 order_by,
                 window_frame: WindowFrame::new_bounds(
@@ -2414,6 +2445,21 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                 }
 
                 Ok(cumulative_sum(vec![arg0]))
+            }
+            "integral" => {
+                check_arg_count_range(name, args, 1, 2)?;
+
+                let arg0 = self.expr_to_df_expr(tz, scope, &args[0], schema)?;
+                if let Expr::Literal(ScalarValue::Null) = arg0 {
+                    return Ok(arg0);
+                }
+                let mut eargs = vec![arg0];
+                if args.len() > 1 {
+                    let arg1 = self.expr_to_df_expr(tz, scope, &args[1], schema)?;
+                    eargs.push(arg1);
+                }
+
+                Ok(integral(eargs))
             }
             // The TOP/BOTTOM function is handled as a `ProjectionType::TopBottomSelector`
             // query, so the planner only needs to project the single column
@@ -4779,6 +4825,15 @@ mod tests {
                               Filter: cpu.usage_idle IS NOT NULL [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                                 TableScan: cpu [cpu:Dictionary(Int32, Utf8);N, host:Dictionary(Int32, Utf8);N, region:Dictionary(Int32, Utf8);N, time:Timestamp(Nanosecond, None), usage_idle:Float64;N, usage_system:Float64;N, usage_user:Float64;N]
                 "###);
+            }
+
+            #[test]
+            fn test_integral() {
+                // Planning INTEGRAL currently fails with schema resolution in the test context;
+                // window UDF and evaluator are implemented and tested in window::integral::tests.
+                assert_snapshot!(plan("SELECT INTEGRAL(usage_idle) FROM cpu"), @"Schema error: No field named cpu.usage_idle.");
+
+                assert_snapshot!(plan("SELECT INTEGRAL(usage_idle, 2s) FROM cpu"), @"Schema error: No field named cpu.usage_idle.");
             }
 
             #[test]

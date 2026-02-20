@@ -25,6 +25,7 @@ pub(super) enum WindowFunction {
     NonNegativeDerivative,
     CumulativeSum,
     Elapsed,
+    Integral,
 }
 
 impl WindowFunction {
@@ -38,6 +39,7 @@ impl WindowFunction {
             NON_NEGATIVE_DERIVATIVE_UDF_NAME => Some(Self::NonNegativeDerivative),
             CUMULATIVE_SUM_UDF_NAME => Some(Self::CumulativeSum),
             ELAPSED_UDF_NAME => Some(Self::Elapsed),
+            INTEGRAL_UDF_NAME => Some(Self::Integral),
             _ => None,
         }
     }
@@ -422,6 +424,67 @@ static CUMULATIVE_SUM: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
             NUMERICS
                 .iter()
                 .map(|dt| TypeSignature::Exact(vec![dt.clone()]))
+                .collect(),
+            Volatility::Immutable,
+        ),
+    }))
+});
+
+const INTEGRAL_UDF_NAME: &str = "integral";
+
+#[derive(Debug)]
+struct IntegralUDF {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for IntegralUDF {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        INTEGRAL_UDF_NAME
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Float64)
+    }
+
+    fn invoke(&self, _args: &[ColumnarValue]) -> Result<ColumnarValue> {
+        error::internal(format!(
+            "{INTEGRAL_UDF_NAME} should not exist in the final logical plan"
+        ))
+    }
+}
+
+/// Create an expression to represent the `INTEGRAL` function.
+pub(crate) fn integral(args: Vec<Expr>) -> Expr {
+    INTEGRAL.call(args)
+}
+
+/// Definition of the `INTEGRAL` function.
+static INTEGRAL: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
+    Arc::new(ScalarUDF::from(IntegralUDF {
+        signature: Signature::one_of(
+            NUMERICS
+                .iter()
+                .flat_map(|dt| {
+                    vec![
+                        TypeSignature::Exact(vec![dt.clone()]),
+                        TypeSignature::Exact(vec![
+                            dt.clone(),
+                            DataType::Duration(TimeUnit::Nanosecond),
+                        ]),
+                        TypeSignature::Exact(vec![
+                            dt.clone(),
+                            DataType::Interval(IntervalUnit::MonthDayNano),
+                        ]),
+                    ]
+                })
                 .collect(),
             Volatility::Immutable,
         ),
