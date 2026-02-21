@@ -1552,14 +1552,16 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             .window(window_func_exprs)?
             .build()?;
 
-        // Rewrite the window columns from the projection, so that the expressions
-        // refer to the columns from the window projection.
+        // Rewrite the window columns from the projection to reference the window output
+        // columns by the alias we set (e.g. "integral"); expr_as_column_expr would use
+        // the full expression name and cause a schema mismatch.
         let select_exprs = select_exprs
             .iter()
             .map(|expr| {
                 expr.clone().transform_up(&|udf_expr| {
-                    Ok(if udfs.contains(&udf_expr) {
-                        Transformed::yes(expr_as_column_expr(&udf_expr, &plan)?)
+                    Ok(if let Some(i) = udfs.iter().position(|u| u == &udf_expr) {
+                        let col_name = window_func_exprs[i].schema_name().to_string();
+                        Transformed::yes(Expr::Column(Column::from_name(col_name)))
                     } else {
                         Transformed::no(udf_expr)
                     })
