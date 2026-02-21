@@ -1617,11 +1617,12 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
         partition_by: Vec<Expr>,
         order_by: Vec<SortExpr>,
     ) -> Result<Expr> {
-        let alias = e.schema_name().to_string();
-
         let Expr::ScalarFunction(ScalarFunction { func, args }) = e else {
             return error::internal(format!("udf_to_expr: unexpected expression: {e}"));
         };
+        // Use function name so window output column matches what projection expects (e.g. "integral");
+        // e.schema_name() can be the full expression and cause "Input field name X does not match" in DataFusion.
+        let alias = func.name().to_string();
 
         fn derivative_unit(ctx: &Context<'_>, args: &[Expr]) -> Result<ScalarValue> {
             if args.len() > 1 {
