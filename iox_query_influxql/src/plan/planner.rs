@@ -2036,40 +2036,42 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                     (ExprScope::Projection, "time") => "time".as_expr(),
                     (_, name) => {
                         let qualified = df_schema.qualified_field_with_unqualified_name(name);
-                        match qualified.as_ref().map(|(_q, f)| f.data_type().clone()) {
-                        Some(src_type) => {
-                            // Use qualified column when schema has it, so Window/type_coercion
-                            // resolve correctly (avoids "No field named table.value").
-                            let column = qualified
-                                .map(|(q, f)| Expr::Column(Column::from((q.cloned(), f.name().clone()))))
-                                .unwrap_or_else(|| name.as_expr());
+                        match &qualified {
+                            Ok((q, f)) => {
+                                let src_type = f.data_type().clone();
+                                // Use qualified column when schema has it, so Window/type_coercion
+                                // resolve correctly (avoids "No field named table.value").
+                                let column =
+                                    Expr::Column(Column::from((*q, *f)));
 
-                            match opt_dst_type.and_then(var_ref_data_type_to_data_type) {
-                                Some(dst_type) => {
-                                    fn is_numeric(dt: &DataType) -> bool {
-                                        matches!(
-                                            dt,
-                                            DataType::Int64 | DataType::Float64 | DataType::UInt64
-                                        )
-                                    }
+                                match opt_dst_type.and_then(var_ref_data_type_to_data_type) {
+                                    Some(dst_type) => {
+                                        fn is_numeric(dt: &DataType) -> bool {
+                                            matches!(
+                                                dt,
+                                                DataType::Int64
+                                                    | DataType::Float64
+                                                    | DataType::UInt64
+                                            )
+                                        }
 
-                                    if src_type == dst_type {
-                                        column
-                                    } else if is_numeric(&src_type) && is_numeric(&dst_type) {
-                                        // InfluxQL only allows casting between numeric types,
-                                        // and it is safe to unconditionally unwrap, as the
-                                        // `is_numeric_type` call guarantees it can be mapped to
-                                        // an Arrow DataType
-                                        column.cast_to(&dst_type, &schema.df_schema)?
-                                    } else {
-                                        // If the cast is incompatible, evaluates to NULL
-                                        Expr::Literal(ScalarValue::Null)
+                                        if src_type == dst_type {
+                                            column
+                                        } else if is_numeric(&src_type) && is_numeric(&dst_type) {
+                                            // InfluxQL only allows casting between numeric types,
+                                            // and it is safe to unconditionally unwrap, as the
+                                            // `is_numeric_type` call guarantees it can be mapped to
+                                            // an Arrow DataType
+                                            column.cast_to(&dst_type, &schema.df_schema)?
+                                        } else {
+                                            // If the cast is incompatible, evaluates to NULL
+                                            Expr::Literal(ScalarValue::Null)
+                                        }
                                     }
+                                    None => column,
                                 }
-                                None => column,
                             }
-                        }
-                        _ => Expr::Literal(ScalarValue::Null),
+                            Err(_) => name.as_expr(),
                         }
                     }
                 })
