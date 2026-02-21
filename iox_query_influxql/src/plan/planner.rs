@@ -1548,8 +1548,13 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        let window_col_names: Vec<String> = window_func_exprs
+            .iter()
+            .map(|e| e.schema_name().to_string())
+            .collect();
+
         let plan = LogicalPlanBuilder::from(input)
-            .window(window_func_exprs.clone())?
+            .window(window_func_exprs)?
             .build()?;
 
         // Rewrite the window columns from the projection to reference the window output
@@ -1560,8 +1565,9 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             .map(|expr| {
                 expr.clone().transform_up(&|udf_expr| {
                     Ok(if let Some(i) = udfs.iter().position(|u| u == &udf_expr) {
-                        let col_name = window_func_exprs[i].schema_name().to_string();
-                        Transformed::yes(Expr::Column(Column::from_name(col_name)))
+                        Transformed::yes(Expr::Column(Column::from_name(
+                            window_col_names[i].as_str(),
+                        )))
                     } else {
                         Transformed::no(udf_expr)
                     })
