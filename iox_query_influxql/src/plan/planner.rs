@@ -2034,13 +2034,15 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                         "time".as_expr()
                     }
                     (ExprScope::Projection, "time") => "time".as_expr(),
-                    (_, name) => match df_schema
-                        .fields_with_unqualified_name(name)
-                        .first()
-                        .map(|f| f.data_type().clone())
-                    {
+                    (_, name) => {
+                        let qualified = df_schema.qualified_field_with_unqualified_name(name);
+                        match qualified.as_ref().map(|(_q, f)| f.data_type().clone()) {
                         Some(src_type) => {
-                            let column = name.as_expr();
+                            // Use qualified column when schema has it, so Window/type_coercion
+                            // resolve correctly (avoids "No field named table.value").
+                            let column = qualified
+                                .map(|(q, f)| Expr::Column(Column::from((q.cloned(), f.name().clone()))))
+                                .unwrap_or_else(|| name.as_expr());
 
                             match opt_dst_type.and_then(var_ref_data_type_to_data_type) {
                                 Some(dst_type) => {
@@ -2068,7 +2070,8 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                             }
                         }
                         _ => Expr::Literal(ScalarValue::Null),
-                    },
+                        }
+                    }
                 })
             }
             IQLExpr::BindParameter(id) => {
