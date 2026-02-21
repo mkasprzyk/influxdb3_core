@@ -1049,8 +1049,10 @@ impl FieldChecker {
         }
 
         // Validate we are using a selector or raw query if non-aggregate fields are projected.
+        // Allow window functions (e.g. integral, derivative) alongside non-aggregate columns;
+        // only classic aggregates (sum, count, etc.) cannot be mixed.
         if self.has_non_aggregate_fields {
-            if self.window_aggregate_count() > 0 {
+            if self.aggregate_count > 0 {
                 return error::query("mixing aggregate and non-aggregate columns is not supported");
             } else if self.selector_count > 1 {
                 return error::query(
@@ -1501,7 +1503,7 @@ impl FieldChecker {
     }
 
     fn check_integral(&mut self, name: &str, args: &[Expr]) -> Result<()> {
-        self.inc_aggregate_count();
+        self.inc_window_count();
         check_exp_args!(name, 1, 2, args);
 
         match args.get(1) {
