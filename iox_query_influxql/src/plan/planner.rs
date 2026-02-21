@@ -1549,7 +1549,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             .collect::<Result<Vec<_>>>()?;
 
         let plan = LogicalPlanBuilder::from(input)
-            .window(window_func_exprs)?
+            .window(window_func_exprs.clone())?
             .build()?;
 
         // Rewrite the window columns from the projection to reference the window output
