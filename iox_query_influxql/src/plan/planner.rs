@@ -1349,7 +1349,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             }
             .alias(alias);
 
-            &select_exprs[time_column_index]
+            select_exprs[time_column_index].clone()
         };
 
         let aggr_group_by_exprs = {
@@ -1373,6 +1373,46 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             group_by_exprs
         };
 
+        // When we have GROUP BY time with only window functions (no aggregates), the aggregate
+        // would otherwise have an empty aggr list and output only [time]. The subsequent
+        // select_window then cannot resolve the window's input column (e.g. "value"). Add
+        // synthetic selector_last(col, time) for each column that window UDFs need, so the
+        // aggregate output has (time, selector_last(...)) and we rewrite window args to use
+        // get_field(selector_last_col, "value") in select_exprs below.
+        let mut window_input_to_selector: Vec<(Expr, Expr)> = Vec::new();
+        if aggr_exprs.is_empty()
+            && ctx.group_by.and_then(|gb| gb.time_dimension()).is_some()
+            && matches!(
+                ctx.projection_type,
+                ProjectionType::WindowAggregate | ProjectionType::WindowAggregateMixed
+            )
+        {
+            let time_expr = input
+                .schema()
+                .qualified_field_with_unqualified_name("time")
+                .map(|(q, f)| Expr::Column(Column::from((q, f))))
+                .unwrap_or_else(|_| "time".as_expr());
+            let window_udfs = find_window_udfs(&select_exprs);
+            for udf_expr in &window_udfs {
+                let Expr::ScalarFunction(ScalarFunction { args, .. }) = udf_expr else {
+                    continue;
+                };
+                let Some(col_expr) = args.first() else {
+                    continue;
+                };
+                // Dedupe: only add one selector_last per column (same expr).
+                if window_input_to_selector
+                    .iter()
+                    .any(|(c, _)| c == col_expr)
+                {
+                    continue;
+                }
+                let sel = selector_last().call(vec![col_expr.clone(), time_expr.clone()]);
+                window_input_to_selector.push((col_expr.clone(), sel.clone()));
+                aggr_exprs.push(sel);
+            }
+        }
+
         if aggr_exprs.is_empty() && aggr_group_by_exprs.is_empty() {
             // If there are no aggregate expressions in the projection, because
             // they all referred to non-existent columns in the table, and there
@@ -1387,6 +1427,34 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
         let plan = LogicalPlanBuilder::from(input)
             .aggregate(aggr_group_by_exprs.clone(), aggr_exprs.clone())?
             .build()?;
+
+        // Rewrite window UDF args so they reference the selector_last output (struct's "value"
+        // field) instead of the raw column, which is no longer in the aggregate schema.
+        if !window_input_to_selector.is_empty() {
+            let col_to_get_field: Vec<(Expr, Expr)> = window_input_to_selector
+                .iter()
+                .map(|(col_expr, selector_expr)| {
+                    let output_name = expr_as_column_expr(selector_expr, &plan)
+                        .map(|e| e.schema_name().to_string())
+                        .unwrap_or_else(|_| selector_expr.schema_name().to_string());
+                    let replacement = col(output_name).field("value");
+                    (col_expr.clone(), replacement)
+                })
+                .collect();
+            for expr in &mut select_exprs {
+                *expr = expr
+                    .clone()
+                    .transform_up(&|e| {
+                        Ok(col_to_get_field
+                            .iter()
+                            .find(|(col, _)| *col == e)
+                            .map(|(_, replacement)| Transformed::yes(replacement.clone()))
+                            .unwrap_or(Transformed::no(e)))
+                    })
+                    .map(|t| t.data)
+                    .expect("transform cannot fail");
+            }
+        }
 
         let fill_option = ctx.fill();
 
@@ -1447,7 +1515,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             ctx.group_by.and_then(|gb| gb.time_dimension()),
             fill_strategy,
         ) {
-            build_gap_fill_node(plan, time_column, fill_strategy, &ctx.projection_type)?
+            build_gap_fill_node(plan, &time_column, fill_strategy, &ctx.projection_type)?
         } else {
             plan
         };
@@ -1498,7 +1566,9 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
         let window_func_exprs = udfs
             .clone()
             .into_iter()
-            .map(|e| Self::udf_to_expr(ctx, e, partition_by.clone(), order_by.clone()))
+            .map(|e| {
+                Self::udf_to_expr(ctx, e, partition_by.clone(), order_by.clone(), input.schema())
+            })
             .collect::<Result<Vec<_>>>()?;
 
         // Recursively handle any nested window functions.
@@ -1624,6 +1694,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
         e: Expr,
         partition_by: Vec<Expr>,
         order_by: Vec<SortExpr>,
+        schema: &DFSchemaRef,
     ) -> Result<Expr> {
         let Expr::ScalarFunction(ScalarFunction { func, args }) = e else {
             return error::internal(format!("udf_to_expr: unexpected expression: {e}"));
@@ -1631,6 +1702,13 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
         // Use function name so window output column matches what projection expects (e.g. "integral");
         // e.schema_name() can be the full expression and cause "Input field name X does not match" in DataFusion.
         let alias = func.name().to_string();
+
+        // Time column for window UDFs: use qualified column when schema has it so the executor
+        // resolves the correct column (avoids wrong integral/derivative when "time" is ambiguous).
+        let time_expr = schema
+            .qualified_field_with_unqualified_name("time")
+            .map(|(q, f)| Expr::Column(Column::from((q, f))))
+            .unwrap_or_else(|_| "time".as_expr());
 
         fn derivative_unit(ctx: &Context<'_>, args: &[Expr]) -> Result<ScalarValue> {
             if args.len() > 1 {
@@ -1701,7 +1779,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
             .alias(alias)),
             Some(udf::WindowFunction::Elapsed) => Ok(Expr::WindowFunction(WindowFunction {
                 fun: ELAPSED.clone(),
-                args: vec![args[0].clone(), lit(elapsed_unit(&args)?), "time".as_expr()],
+                args: vec![args[0].clone(), lit(elapsed_unit(&args)?), time_expr.clone()],
                 partition_by,
                 order_by,
                 window_frame: WindowFrame::new_bounds(
@@ -1732,7 +1810,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                 args: vec![
                     args[0].clone(),
                     lit(derivative_unit(ctx, &args)?),
-                    "time".as_expr(),
+                    time_expr.clone(),
                 ],
                 partition_by,
                 order_by,
@@ -1750,7 +1828,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                     args: vec![
                         args[0].clone(),
                         lit(derivative_unit(ctx, &args)?),
-                        "time".as_expr(),
+                        time_expr.clone(),
                     ],
                     partition_by,
                     order_by,
@@ -1781,7 +1859,7 @@ impl<'a> InfluxQLToLogicalPlan<'a> {
                 args: vec![
                     args[0].clone(),
                     lit(integral_unit(ctx, &args)?),
-                    "time".as_expr(),
+                    time_expr.clone(),
                 ],
                 partition_by,
                 order_by,
